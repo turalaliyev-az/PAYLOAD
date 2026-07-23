@@ -177,6 +177,8 @@ enum TestMode : uint8_t { MODE_NORMAL = 0, MODE_SIT, MODE_SUT };
 volatile TestMode currentMode = MODE_NORMAL;
 volatile bool testRunning = false;
 volatile bool synDataValid = false;
+volatile TestMode pendingMode = MODE_NORMAL;
+volatile uint32_t pendingStartTime = 0;
 
 float synAlt = 0.0f, synAccX = 0.0f, synAccY = 0.0f, synAccZ = 0.0f;
 float synAngX = 0.0f, synAngY = 0.0f, synAngZ = 0.0f;
@@ -204,11 +206,14 @@ void send_sit_telemetry() {
   uint8_t idx = 0;
   pkt[idx++] = 0xAB;  // Header
 
+  // EK-7: Big-Endian byte sıralaması (MSB first)
   auto append_float = [&](float val) {
     uint8_t* b = (uint8_t*)&val;
-    for (int i = 0; i < 4; i++) pkt[idx++] = b[i];
+    for (int i = 3; i >= 0; i--) pkt[idx++] = b[i];
   };
 
+  // EK-7: irtifa 0.0-10000.0 araliginda olmalidir, menfi olursa 0'a clamp et
+  if (snap.altitude < 0.0f) snap.altitude = 0.0f;
   append_float(snap.altitude);
   append_float(snap.bme_pres);
   append_float(snap.accel_x);
@@ -224,6 +229,21 @@ void send_sit_telemetry() {
   pkt[idx++] = 0x0D;
   pkt[idx++] = 0x0A;
 
+  // ---------- DEBUG: qısa SIT özeti ----------
+  static uint32_t last_sit_debug = 0;
+  if (millis() - last_sit_debug >= 1000) {  // saniyede 1 defe
+    Serial1.print("[SIT] A:"); Serial1.print(snap.altitude, 1);
+    Serial1.print(" P:"); Serial1.print(snap.bme_pres, 1);
+    Serial1.print(" X:"); Serial1.print(snap.accel_x, 1);
+    Serial1.print(" Y:"); Serial1.print(snap.accel_y, 1);
+    Serial1.print(" Z:"); Serial1.print(snap.accel_z, 1);
+    Serial1.print(" aX:"); Serial1.print(snap.angle_x, 1);
+    Serial1.print(" aY:"); Serial1.print(snap.angle_y, 1);
+    Serial1.print(" aZ:"); Serial1.println(snap.angle_z, 1);
+    last_sit_debug = millis();
+  }
+  // ------------------------------------------
+
   if (Serial6.availableForWrite() >= idx) {
     Serial6.write(pkt, idx);
   }
@@ -238,10 +258,12 @@ void parse_synthetic_data(const uint8_t* buf, uint8_t len) {
   uint8_t calc = calc_checksum(buf, 33);
   if (calc != buf[33]) return; // 33-cü indeks Checksum
 
-  // memcpy ilə çıxarılır — buf+1 4-baytlıq sərhədə düşməyə bilər, birbaşa
-  // float* cast həm alignment, həm strict-aliasing qaydasını pozardı.
+  // EK-7: Big Endian byte sıralaması ilə gəlir -> Little Endian float
   auto read_float = [&](uint8_t field_idx) {
-    float v; memcpy(&v, buf + 1 + field_idx * 4, sizeof(float)); return v;
+    uint8_t tmp[4];
+    const uint8_t* src = buf + 1 + field_idx * 4;
+    tmp[0] = src[3]; tmp[1] = src[2]; tmp[2] = src[1]; tmp[3] = src[0]; // reverse
+    float v; memcpy(&v, tmp, sizeof(float)); return v;
   };
   xSemaphoreTake(data_mutex, portMAX_DELAY);
   synAlt   = read_float(0);
@@ -329,19 +351,24 @@ void play_buzzer_tone(int frequency, int duration_ms) {
 // ════════════════════════════════════════════════════════════
 void start_sit() {
   if (currentMode != MODE_NORMAL) return;
-  currentMode = MODE_SIT; testRunning = true; synDataValid = false;
+  // EK-7: non-blocking 1 sn gecikme – test_tx_task aktivlesdirir
+  pendingMode = MODE_SIT; pendingStartTime = millis();
+  Serial1.println("[SIT] Komut alindi, 1 sn sonra baslayacak...");
   play_buzzer_tone(400, 100);
 }
 void start_sut() {
   if (currentMode != MODE_NORMAL) return;
-  currentMode = MODE_SUT; testRunning = true; synDataValid = false;
   xSemaphoreTake(data_mutex, portMAX_DELAY); statusBits = 0; xSemaphoreGive(data_mutex);
+  pendingMode = MODE_SUT; pendingStartTime = millis();
+  Serial1.println("[SUT] Komut alindi, 1 sn sonra baslayacak...");
   play_buzzer_tone(600, 150);
 }
 void stop_test() {
-  if (!testRunning) return;
+  if (!testRunning && pendingMode == MODE_NORMAL) return;
   currentMode = MODE_NORMAL; testRunning = false; synDataValid = false;
+  pendingMode = MODE_NORMAL;
   xSemaphoreTake(data_mutex, portMAX_DELAY); statusBits = 0; xSemaphoreGive(data_mutex);
+  Serial1.println("[TEST] Durduruldu.");
   play_buzzer_tone(200, 200);
 }
 
@@ -352,37 +379,66 @@ void stop_test() {
 void rs232_rx_task(void*) {
   static uint8_t buf[64];
   static uint8_t idx = 0;
+  static int raw_count = 0;
   for (;;) {
     while (Serial6.available()) {
       uint8_t c = Serial6.read();
+
+      // ---------- DEBUG: qısa hex (10 baytdan bir sətir) ----------
+      if (raw_count == 0) Serial1.print("[R] ");
+      Serial1.print(c >> 4, HEX); Serial1.print(c & 0x0F, HEX); Serial1.print(' ');
+      raw_count++;
+      if (raw_count >= 10) { Serial1.println(); raw_count = 0; }
+      // ------------------------------------------------------------
+      static const char hex_digits[] = "0123456789ABCDEF"; // PKT-AA/AB çapı üçün
+
       if (idx == 0 && c != 0xAA && c != 0xAB) continue;
       buf[idx++] = c;
 
-      // Əmr paketi (0xAA, 5 bayt) – Cədvəl 1-dəki rəsmi (sabit) checksum-lar
+      // Əmr paketi (0xAA, 5 bayt) – Header DAXİL checksum (header+cmd)
       if (buf[0] == 0xAA && idx >= 5) {
+        // Paketin tam şəklini də Serial1-ə yaz
+        Serial1.print("\n[PKT-AA] ");
+        for (uint8_t i = 0; i < 5; i++) { Serial1.print("0x"); Serial1.print(hex_digits[buf[i] >> 4]); Serial1.print(hex_digits[buf[i] & 0x0F]); Serial1.print(' '); }
+        Serial1.println();
+        raw_count = 0;
+
         if (buf[3] == 0x0D && buf[4] == 0x0A) {
           uint8_t cmd = buf[1];
-          uint8_t expected_csum = 0;
-          if (cmd == 0x20) expected_csum = 0x8C;
-          else if (cmd == 0x22) expected_csum = 0x8E;
-          else if (cmd == 0x24) expected_csum = 0x90;
+          uint8_t calc_csum = calc_checksum(buf, 2); // Header (0xAA) + Cmd
 
-          if (buf[2] == expected_csum) {
-            if (cmd == 0x20) start_sit();
-            else if (cmd == 0x22) start_sut();
-            else if (cmd == 0x24) stop_test();
+          if (buf[2] == calc_csum) {
+            Serial1.print("[CMD] Checksum OK – ");
+            if (cmd == 0x20) { start_sit(); Serial1.println("SIT baslatildi"); }
+            else if (cmd == 0x22) { start_sut(); Serial1.println("SUT baslatildi"); }
+            else if (cmd == 0x24) { stop_test(); Serial1.println("STOP"); }
+            else Serial1.println("bilinmeyen emr");
+          } else {
+            Serial1.print("[CMD] Checksum HATALI! alindi=0x"); Serial1.print(hex_digits[buf[2] >> 4]); Serial1.print(hex_digits[buf[2] & 0x0F]); Serial1.print(" beklenen=0x"); Serial1.print(hex_digits[calc_csum >> 4]); Serial1.println(hex_digits[calc_csum & 0x0F]);
           }
+        } else {
+          Serial1.println("[CMD] 0x0D 0x0A sonlanma YOK");
         }
         idx = 0; continue;
       }
 
       // ✅ SUT sintetik veri paketi (0xAB, 36 bayt) – Header daxil
       if (buf[0] == 0xAB && idx >= 36) {
+        Serial1.print("\n[PKT-AB] ");
+        for (uint8_t i = 0; i < 36; i++) { Serial1.print("0x"); Serial1.print(hex_digits[buf[i] >> 4]); Serial1.print(hex_digits[buf[i] & 0x0F]); Serial1.print(' '); }
+        Serial1.println();
+        raw_count = 0;
+
         if (buf[34] == 0x0D && buf[35] == 0x0A) {
           uint8_t calc = calc_checksum(buf, 33); // Header daxil
           if (calc == buf[33]) {
             parse_synthetic_data(buf, 36);
+            Serial1.println("[DATA] SUT veri alindi, checksum OK");
+          } else {
+            Serial1.print("[DATA] Checksum HATALI! calc=0x"); Serial1.print(hex_digits[calc >> 4]); Serial1.print(hex_digits[calc & 0x0F]); Serial1.print(" pkt=0x"); Serial1.print(hex_digits[buf[33] >> 4]); Serial1.println(hex_digits[buf[33] & 0x0F]);
           }
+        } else {
+          Serial1.println("[DATA] 0x0D 0x0A sonlanma YOK");
         }
         idx = 0; continue;
       }
@@ -400,6 +456,14 @@ void test_tx_task(void*) {
   TickType_t lastWake = xTaskGetTickCount();
   uint16_t prevStatus = 0;
   for (;;) {
+    // EK-7: pending mode – 1 saniye sonra testi aktivlestir
+    if (pendingMode != MODE_NORMAL && (millis() - pendingStartTime) >= 1000) {
+      currentMode = pendingMode; testRunning = true; synDataValid = false;
+      pendingMode = MODE_NORMAL;
+      Serial1.print("[TEST] ");
+      Serial1.println(currentMode == MODE_SIT ? "SIT baslatildi!" : "SUT baslatildi!");
+    }
+
     if (testRunning) {
       if (currentMode == MODE_SIT) {
         send_sit_telemetry();
